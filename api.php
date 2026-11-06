@@ -1,13 +1,10 @@
 
 <?php
-declare(strict_types=1);
 
 // ======================================================
 // HEISVERSE - Main API
 // ======================================================
 
-// Do not display PHP errors to website visitors.
-// Errors are written to the server log instead.
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 
@@ -22,33 +19,34 @@ require_once __DIR__ . '/includes/movie-sources.php';
 // JSON RESPONSE HELPERS
 // ======================================================
 
-function jsonResponse(array $data, int $status = 200): void
+function hvJsonResponse(array $data, int $status = 200): void
 {
     http_response_code($status);
 
     echo json_encode(
         $data,
         JSON_UNESCAPED_SLASHES |
-        JSON_INVALID_UTF8_SUBSTITUTE
+        JSON_INVALID_UTF8_SUBSTITUTE |
+        JSON_PARTIAL_OUTPUT_ON_ERROR
     );
 
     exit;
 }
 
-function fail(string $message, int $status = 400): void
+function hvFail(string $message, int $status = 400): void
 {
     if ($status < 400 || $status > 599) {
         $status = 500;
     }
 
-    jsonResponse(['error' => $message], $status);
+    hvJsonResponse(['error' => $message], $status);
 }
 
 // ======================================================
 // GENRES
 // ======================================================
 
-$GENRES = [
+$HV_GENRES = [
     28 => 'Action',
     12 => 'Adventure',
     35 => 'Comedy',
@@ -72,54 +70,60 @@ $GENRES = [
 
 // ======================================================
 // TMDB REQUEST
+// Requires tmdb_request() in includes/functions.php
 // ======================================================
 
-function tmdb(string $path, array $query = []): array
+function hvTmdb(string $path, array $query = []): array
 {
+    if (!function_exists('tmdb_request')) {
+        error_log('HEISVERSE: tmdb_request() is missing.');
+        hvFail('TMDB service is not configured correctly.', 500);
+    }
+
     try {
         $result = tmdb_request($path, $query);
 
         if (!is_array($result)) {
-            throw new RuntimeException('Invalid response from TMDB.', 502);
+            throw new RuntimeException('Invalid TMDB response.', 502);
         }
 
         return $result;
 
-    } catch (RuntimeException $e) {
+    } catch (Throwable $e) {
+        error_log('HEISVERSE TMDB error: ' . $e->getMessage());
+
         $status = (int) $e->getCode();
 
         if ($status < 400 || $status > 599) {
             $status = 502;
         }
 
-        error_log('HEISVERSE TMDB error: ' . $e->getMessage());
-
-        fail($e->getMessage(), $status);
+        hvFail('Could not retrieve movie information from TMDB.', $status);
     }
 }
 
 // ======================================================
-// NORMALIZE TMDB MOVIE
+// NORMALIZE MOVIE DATA
 // ======================================================
 
-function norm(array $movie): array
+function hvNormalizeMovie(array $movie): array
 {
-    global $GENRES;
+    global $HV_GENRES;
 
     $genreNames = [];
 
     foreach ($movie['genre_ids'] ?? [] as $genreId) {
         $genreId = (int) $genreId;
 
-        if (isset($GENRES[$genreId])) {
-            $genreNames[] = $GENRES[$genreId];
+        if (isset($HV_GENRES[$genreId])) {
+            $genreNames[] = $HV_GENRES[$genreId];
         }
     }
 
     return [
         'id' => (int) ($movie['id'] ?? 0),
         'title' => $movie['title'] ?? 'Untitled',
-        'year' => substr($movie['release_date'] ?? '', 0, 4),
+        'year' => substr((string) ($movie['release_date'] ?? ''), 0, 4),
         'poster' => $movie['poster_path'] ?? null,
         'backdrop' => $movie['backdrop_path'] ?? null,
         'rating' => round((float) ($movie['vote_average'] ?? 0), 1),
@@ -132,7 +136,7 @@ function norm(array $movie): array
 // MOVIE LIST RESPONSE
 // ======================================================
 
-function listOut(array $response): void
+function hvListOut(array $response): void
 {
     $results = $response['results'] ?? [];
 
@@ -140,49 +144,34 @@ function listOut(array $response): void
         $results = [];
     }
 
-    jsonResponse([
+    $results = array_filter($results, 'is_array');
+
+    hvJsonResponse([
         'page' => max(1, (int) ($response['page'] ?? 1)),
         'total_pages' => min(
             500,
             max(1, (int) ($response['total_pages'] ?? 1))
         ),
-        'results' => array_map(
-            'norm',
-            array_filter($results, 'is_array')
-        )
+        'results' => array_map('hvNormalizeMovie', $results)
     ]);
 }
 
 // ======================================================
-// DATABASE CATALOG
+// DATABASE ERROR HANDLING
 // ======================================================
 
-function catalogDb(callable $callback): void
+function hvCatalog(callable $callback): void
 {
     try {
         $callback();
 
-    } catch (PDOException $e) {
+    } catch (Throwable $e) {
+        error_log('HEISVERSE database/catalog error: ' . $e->getMessage());
 
-        error_log('HEISVERSE database error: ' . $e->getMessage());
-
-        // Do not expose database credentials or SQL errors.
-        fail(
-            'The movie catalog database could not be accessed. Check your database connection and imported tables.',
+        hvFail(
+            'The movie catalog could not be loaded. Check the database connection and database tables.',
             503
         );
-
-    } catch (RuntimeException $e) {
-
-        error_log('HEISVERSE catalog error: ' . $e->getMessage());
-
-        $status = (int) $e->getCode();
-
-        if ($status < 400 || $status > 599) {
-            $status = 503;
-        }
-
-        fail($e->getMessage(), $status);
     }
 }
 
@@ -211,23 +200,23 @@ try {
 
     switch ($action) {
 
-        // --------------------------------------------------
+        // ==============================================
         // TRENDING MOVIES
-        // --------------------------------------------------
+        // ==============================================
 
         case 'trending':
 
-            listOut(
-                tmdb('/trending/movie/week', [
+            hvListOut(
+                hvTmdb('/trending/movie/week', [
                     'page' => $page
                 ])
             );
 
             break;
 
-        // --------------------------------------------------
+        // ==============================================
         // DISCOVER MOVIES
-        // --------------------------------------------------
+        // ==============================================
 
         case 'discover':
 
@@ -239,7 +228,6 @@ try {
             ];
 
             if (!empty($_GET['africa'])) {
-
                 $query['with_origin_country'] =
                     'NG|GH|ZA|KE|EG|RW|TZ|UG|MA|SN|CI|ET|CM';
 
@@ -255,23 +243,23 @@ try {
 
                 if (
                     $genreId === false ||
-                    !isset($GENRES[$genreId])
+                    !isset($HV_GENRES[$genreId])
                 ) {
-                    fail('Unknown genre.');
+                    hvFail('Unknown genre.');
                 }
 
                 $query['with_genres'] = $genreId;
             }
 
-            listOut(
-                tmdb('/discover/movie', $query)
+            hvListOut(
+                hvTmdb('/discover/movie', $query)
             );
 
             break;
 
-        // --------------------------------------------------
+        // ==============================================
         // SEARCH MOVIES
-        // --------------------------------------------------
+        // ==============================================
 
         case 'search':
 
@@ -279,13 +267,14 @@ try {
 
             if (
                 $term === '' ||
-                mb_strlen($term) > 100
+                strlen($term) > 300 ||
+                (function_exists('mb_strlen') && mb_strlen($term) > 100)
             ) {
-                fail('Type 1 to 100 characters to search.');
+                hvFail('Enter a search term of 1 to 100 characters.');
             }
 
-            listOut(
-                tmdb('/search/movie', [
+            hvListOut(
+                hvTmdb('/search/movie', [
                     'query' => $term,
                     'include_adult' => 'false',
                     'page' => $page
@@ -294,9 +283,9 @@ try {
 
             break;
 
-        // --------------------------------------------------
+        // ==============================================
         // TMDB MOVIE DETAILS
-        // --------------------------------------------------
+        // ==============================================
 
         case 'detail':
 
@@ -306,7 +295,7 @@ try {
             );
 
             if ($id === false || $id < 1) {
-                fail('Invalid movie ID.');
+                hvFail('Invalid movie ID.');
             }
 
             $region = strtoupper(
@@ -321,16 +310,14 @@ try {
                 $region = DEFAULT_REGION;
             }
 
-            $movie = tmdb(
+            $movie = hvTmdb(
                 '/movie/' . $id,
                 [
                     'append_to_response' => 'videos,watch/providers'
                 ]
             );
 
-            $output = norm(
-                $movie + ['genre_ids' => []]
-            );
+            $output = hvNormalizeMovie($movie);
 
             $output['genres'] = array_map(
                 fn($genre) => $genre['name'] ?? '',
@@ -338,13 +325,12 @@ try {
             );
 
             $output['runtime'] = (int) ($movie['runtime'] ?? 0);
-
             $output['tagline'] = $movie['tagline'] ?? '';
 
             $output['tmdbUrl'] =
                 'https://www.themoviedb.org/movie/' . $id;
 
-            // Find a YouTube trailer.
+            // Find an official YouTube trailer where available.
             $trailer = null;
 
             foreach ($movie['videos']['results'] ?? [] as $video) {
@@ -357,7 +343,6 @@ try {
                         (string) ($video['key'] ?? '')
                     )
                 ) {
-
                     if (
                         $trailer === null ||
                         !empty($video['official'])
@@ -399,41 +384,38 @@ try {
                 ];
 
             } else {
-
                 $output['providers'] = null;
             }
 
             $output['region'] = $region;
 
-            jsonResponse($output);
+            hvJsonResponse($output);
 
             break;
 
-        // --------------------------------------------------
-        // ADMIN PUBLISHED MOVIE CATALOG
-        // --------------------------------------------------
+        // ==============================================
+        // PUBLISHED MOVIE CATALOG
+        // Requires database helper functions
+        // ==============================================
 
         case 'catalog':
 
-            catalogDb(function () use ($page) {
+            hvCatalog(function () use ($page) {
 
                 $perPage = 24;
 
-                $where = [
-                    published_sql('m')
-                ];
-
+                $where = [published_sql('m')];
                 $args = [];
 
-                // Search catalog by title.
-                $term = trim(
-                    (string) ($_GET['q'] ?? '')
-                );
+                $term = trim((string) ($_GET['q'] ?? ''));
 
                 if ($term !== '') {
 
-                    if (mb_strlen($term) > 100) {
-                        fail('Search term is too long.');
+                    if (
+                        (function_exists('mb_strlen') && mb_strlen($term) > 100) ||
+                        strlen($term) > 300
+                    ) {
+                        hvFail('Search term is too long.');
                     }
 
                     $where[] = 'm.title LIKE ?';
@@ -444,21 +426,19 @@ try {
                         '%';
                 }
 
-                // Filter by genre.
-                $genre = trim(
-                    (string) ($_GET['genre'] ?? '')
-                );
+                $genre = trim((string) ($_GET['genre'] ?? ''));
 
                 if ($genre !== '') {
 
                     $where[] = 'FIND_IN_SET(?, m.genres) > 0';
 
-                    $args[] = mb_substr($genre, 0, 30);
+                    $args[] = function_exists('mb_substr')
+                        ? mb_substr($genre, 0, 30)
+                        : substr($genre, 0, 30);
                 }
 
                 $whereSql = implode(' AND ', $where);
 
-                // Total movie count.
                 $countStatement = db()->prepare(
                     "SELECT COUNT(*) FROM movies m WHERE $whereSql"
                 );
@@ -469,7 +449,6 @@ try {
 
                 $offset = ($page - 1) * $perPage;
 
-                // Fetch published movies.
                 $statement = db()->prepare(
                     "SELECT m.*
                      FROM movies m
@@ -494,7 +473,6 @@ try {
                     'results' => $movies
                 ];
 
-                // Include available genres on first page.
                 if ($page === 1) {
 
                     $genres = [];
@@ -510,7 +488,6 @@ try {
                         foreach (
                             explode(',', $row['genres'] ?? '') as $name
                         ) {
-
                             $name = trim($name);
 
                             if ($name !== '') {
@@ -524,18 +501,18 @@ try {
                     sort($result['genres']);
                 }
 
-                jsonResponse($result);
+                hvJsonResponse($result);
             });
 
             break;
 
-        // --------------------------------------------------
-        // PUBLISHED CATALOG MOVIE DETAILS
-        // --------------------------------------------------
+        // ==============================================
+        // PUBLISHED MOVIE DETAILS
+        // ==============================================
 
         case 'catalog_detail':
 
-            catalogDb(function () {
+            hvCatalog(function () {
 
                 $id = filter_var(
                     $_GET['id'] ?? 0,
@@ -543,7 +520,7 @@ try {
                 );
 
                 if ($id === false || $id < 1) {
-                    fail('Invalid movie ID.');
+                    hvFail('Invalid movie ID.');
                 }
 
                 $statement = db()->prepare(
@@ -558,15 +535,13 @@ try {
                 $movie = $statement->fetch();
 
                 if (!$movie) {
-                    fail('This movie is not available.', 404);
+                    hvFail('This movie is not available.', 404);
                 }
 
                 $output = catalog_row($movie);
 
                 $output['runtime'] = (int) ($movie['runtime'] ?? 0);
-
                 $output['tagline'] = $movie['tagline'] ?? '';
-
                 $output['trailer'] = $movie['trailer_key'] ?? '';
 
                 $rights = rights_options();
@@ -574,7 +549,7 @@ try {
                 $output['rights'] =
                     $rights[$movie['rights_status']] ?? '';
 
-                // Only active playback sources are returned.
+                // Return only active playback sources.
                 $sources = movie_sources_of($id);
 
                 $output['sources'] = array_map(
@@ -588,29 +563,29 @@ try {
                     )
                 );
 
-                jsonResponse($output);
+                hvJsonResponse($output);
             });
 
             break;
 
-        // --------------------------------------------------
+        // ==============================================
         // UNKNOWN ACTION
-        // --------------------------------------------------
+        // ==============================================
 
         default:
 
-            fail('Unknown API action.', 404);
+            hvFail('Unknown API action.', 404);
     }
 
 } catch (Throwable $e) {
 
     error_log(
-        'HEISVERSE API unexpected error: ' .
+        'HEISVERSE API error: ' .
         $e->getMessage()
     );
 
-    fail(
-        'An unexpected server error occurred. Please try again later.',
+    hvFail(
+        'An unexpected server error occurred. Check the Render logs.',
         500
     );
 }
